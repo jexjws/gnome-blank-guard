@@ -1,0 +1,31 @@
+# gnome-blank-guard configuration
+#
+# User config:  ~/.config/gnome-blank-guard.conf   (takes precedence)
+# System-wide:  /etc/gnome-blank-guard.conf
+#
+# Restart the service after editing:
+#   sudo systemctl restart gnome-blank-guard@<your-username>
+
+[guard]
+
+# Swallow mouse motion/clicks while the screen is blanked.
+BLOCK_MOUSE = true
+
+# Swallow touchpad motion/clicks while the screen is blanked.
+BLOCK_TOUCHPAD = true
+
+# Swallow keyboard input while the screen is blanked, so only the power button
+# can wake the screen. Set to false if you want any key to wake it.
+BLOCK_KEYBOARD = true
+
+# Temporarily enable Do Not Disturb (org.gnome.desktop.notifications
+# show-banners=false) while the screen is blanked. GNOME Shell wakes a blanked
+# screen when it shows a notification banner, so this is required to keep the
+# screen dark when messages arrive.
+# Notifications are still collected in the notification list and become visible
+# again after waking.
+SUPPRESS_NOTIFICATIONS = true
+
+# Safety net: if something else (an application, a device that was not grabbed,
+# ...) still manages to turn the display on, blank it again ~0.7 s later.
+REENFORCE_BLANK = true

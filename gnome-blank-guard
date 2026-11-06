@@ -1,0 +1,499 @@
+#!/usr/bin/env python3
+"""
+gnome-blank-guard — keep a blanked GNOME screen dark until you press the power button.
+
+While GNOME (Mutter) has the display blanked / DPMS-off, this daemon:
+
+  1. exclusively grabs (EVIOCGRAB) every mouse, touchpad and keyboard, so that
+     pointer jitter, a brushed touchpad or a key press can never reach the
+     compositor and light the panel up again;
+  2. temporarily enables Do Not Disturb (org.gnome.desktop.notifications
+     show-banners=false), because GNOME Shell wakes the screen when it shows a
+     notification banner (see gnome-shell issue #5885). The previous value is
+     restored on wake, and persisted so a crash cannot leave DND stuck on;
+  3. keeps the physical power button as the only wake source: pressing it
+     releases every grab and turns the display back on via the Mutter
+     DisplayConfig PowerSaveMode property;
+  4. as a safety net, re-blanks the screen if something else manages to wake it.
+
+Requires: GNOME on Wayland (Mutter), Python 3 + PyGObject, and read access to
+/dev/input/event* (the shipped systemd unit adds the "input" supplementary group).
+
+License: MIT
+"""
+
+import configparser
+import fcntl
+import glob
+import logging
+import os
+import signal
+import struct
+import sys
+
+import gi
+
+gi.require_version("GLib", "2.0")
+gi.require_version("Gio", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+VERSION = "1.1.0"
+
+log = logging.getLogger("gnome-blank-guard")
+
+# --- Linux input subsystem -------------------------------------------------
+EVIOCGRAB = 0x40044590  # _IOW('E', 0x90, int) -- grab/release an evdev device
+EV_KEY = 1
+KEY_POWER = 116
+KEY_WAKEUP = 143
+# struct input_event on 64-bit Linux: timeval(16) + u16 type + u16 code + s32 value
+INPUT_EVENT_FMT = "qqHHi"
+INPUT_EVENT_SIZE = struct.calcsize(INPUT_EVENT_FMT)
+
+# --- GNOME / D-Bus ---------------------------------------------------------
+DISPLAY_CONFIG_NAME = "org.gnome.Mutter.DisplayConfig"
+DISPLAY_CONFIG_PATH = "/org/gnome/Mutter/DisplayConfig"
+DISPLAY_CONFIG_IFACE = "org.gnome.Mutter.DisplayConfig"
+
+NOTIFICATIONS_SCHEMA = "org.gnome.desktop.notifications"
+SHOW_BANNERS_KEY = "show-banners"
+
+# PowerSaveMode values (see MetaPowerSave in mutter)
+PS_ON = 0
+
+# --- paths -----------------------------------------------------------------
+CONFIG_PATHS = [
+    os.path.expanduser("~/.config/gnome-blank-guard.conf"),
+    "/etc/gnome-blank-guard.conf",
+]
+STATE_DIR = os.path.expanduser("~/.cache/gnome-blank-guard")
+STATE_FILE = os.path.join(STATE_DIR, "notif-state")
+
+DEFAULTS = {
+    "BLOCK_MOUSE": True,
+    "BLOCK_TOUCHPAD": True,
+    "BLOCK_KEYBOARD": True,
+    "SUPPRESS_NOTIFICATIONS": True,
+    "REENFORCE_BLANK": True,
+}
+
+REENFORCE_DELAY_MS = 700
+BUS_RETRY_SEC = 3
+
+
+def load_config():
+    config = dict(DEFAULTS)
+    parser = configparser.ConfigParser()
+    for path in CONFIG_PATHS:
+        if not os.path.exists(path):
+            continue
+        try:
+            parser.read(path)
+            section = "guard" if "guard" in parser else (
+                parser.sections()[0] if parser.sections() else None
+            )
+            if section:
+                for key in config:
+                    config[key] = parser.getboolean(section, key, fallback=config[key])
+            log.info("Loaded config from %s: %s", path, config)
+            break
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to parse %s: %s", path, exc)
+    return config
+
+
+def _read_hex(path):
+    with open(path) as handle:
+        return int(handle.read().strip() or "0", 16)
+
+
+def _supports_key(path, code):
+    """Return True if the device's key capability bitmap contains `code`."""
+    try:
+        with open(path) as handle:
+            words = [int(word, 16) for word in handle.read().split()]
+    except (OSError, ValueError):
+        return False
+    # sysfs prints the bitmap most-significant word first
+    words.reverse()
+    index, bit = divmod(code, 64)
+    return len(words) > index and bool(words[index] & (1 << bit))
+
+
+def scan_devices(config):
+    """Classify /dev/input/event* nodes into power buttons, mice, touchpads, keyboards."""
+    power_buttons, mice, touchpads, keyboards = [], [], [], []
+
+    for event_node in sorted(glob.glob("/dev/input/event*")):
+        dev_dir = "/sys/class/input/{}/device".format(os.path.basename(event_node))
+        if not os.path.exists(dev_dir):
+            continue
+
+        name_file = os.path.join(dev_dir, "name")
+        try:
+            with open(name_file) as handle:
+                name = handle.read().strip()
+        except OSError:
+            name = ""
+
+        rel_file = os.path.join(dev_dir, "capabilities", "rel")
+        key_file = os.path.join(dev_dir, "capabilities", "key")
+        lowered = name.lower()
+
+        if "power button" in lowered:
+            power_buttons.append((event_node, name))
+            continue
+
+        if "touchpad" in lowered or "trackpad" in lowered:
+            if config["BLOCK_TOUCHPAD"]:
+                touchpads.append((event_node, name))
+            continue
+
+        # Relative pointer: REL_X + REL_Y (bits 0 and 1)
+        if config["BLOCK_MOUSE"] and os.path.exists(rel_file):
+            try:
+                if (_read_hex(rel_file) & 0b11) == 0b11:
+                    mice.append((event_node, name))
+                    continue
+            except (OSError, ValueError):
+                pass
+
+        if config["BLOCK_KEYBOARD"]:
+            if os.path.exists(key_file) and _supports_key(key_file, 57) and _supports_key(key_file, 28):
+                keyboards.append((event_node, name))
+                continue
+            if "keyboard" in lowered:
+                keyboards.append((event_node, name))
+                continue
+
+    return power_buttons, mice, touchpads, keyboards
+
+
+class ScreenSleepGuard:
+    def __init__(self):
+        self.config = load_config()
+        self.loop = GLib.MainLoop()
+        self.bus = None
+        self.grabbed = {}          # fd -> (path, name, watch_id, is_power)
+        self.is_guarded = False
+        self.self_wake = False     # this wake-up was caused by our power key handler
+        self.reenforce_source = 0
+        self.notif_settings = None
+        self.saved_show_banners = None
+
+    # ---------------- notification suppression ----------------
+    def _read_state_file(self):
+        try:
+            with open(STATE_FILE) as handle:
+                return handle.read().strip() == "true"
+        except OSError:
+            return None
+
+    def _write_state_file(self, value):
+        try:
+            os.makedirs(STATE_DIR, exist_ok=True)
+            with open(STATE_FILE, "w") as handle:
+                handle.write("true" if value else "false")
+        except OSError as exc:
+            log.warning("Failed to write state file: %s", exc)
+
+    def _clear_state_file(self):
+        try:
+            os.unlink(STATE_FILE)
+        except OSError:
+            pass
+
+    def suppress_notifications(self):
+        if not self.config["SUPPRESS_NOTIFICATIONS"]:
+            return
+        try:
+            if self.notif_settings is None:
+                self.notif_settings = Gio.Settings.new(NOTIFICATIONS_SCHEMA)
+
+            persisted = self._read_state_file()
+            if persisted is not None:
+                # a previous run died while engaged -- trust the persisted value
+                self.saved_show_banners = persisted
+                log.info("Recovered original notification state from state file.")
+            elif self.saved_show_banners is None:
+                self.saved_show_banners = self.notif_settings.get_boolean(SHOW_BANNERS_KEY)
+                self._write_state_file(self.saved_show_banners)
+
+            if self.notif_settings.get_boolean(SHOW_BANNERS_KEY):
+                self.notif_settings.set_boolean(SHOW_BANNERS_KEY, False)
+                log.info("Notifications suppressed (show-banners=false) to prevent wake.")
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to suppress notifications: %s", exc)
+
+    def restore_notifications(self):
+        if self.saved_show_banners is None:
+            self.saved_show_banners = self._read_state_file()
+        if self.saved_show_banners is None:
+            return
+        try:
+            if self.notif_settings is None:
+                self.notif_settings = Gio.Settings.new(NOTIFICATIONS_SCHEMA)
+            self.notif_settings.set_boolean(SHOW_BANNERS_KEY, self.saved_show_banners)
+            log.info("Notifications restored (show-banners=%s).",
+                     str(self.saved_show_banners).lower())
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to restore notifications: %s", exc)
+        finally:
+            self._clear_state_file()
+            self.saved_show_banners = None
+
+    # ---------------- D-Bus ----------------
+    def connect_bus(self):
+        try:
+            self.bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+            log.info("Connected to the session bus.")
+            return True
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Cannot connect to the session bus (%s); retrying in %ss.",
+                        exc, BUS_RETRY_SEC)
+            self.bus = None
+            return False
+
+    def get_power_save_mode(self):
+        try:
+            reply = self.bus.call_sync(
+                DISPLAY_CONFIG_NAME, DISPLAY_CONFIG_PATH,
+                "org.freedesktop.DBus.Properties", "Get",
+                GLib.Variant("(ss)", (DISPLAY_CONFIG_IFACE, "PowerSaveMode")),
+                None, Gio.DBusCallFlags.NONE, 1000, None,
+            )
+            return reply.unpack()[0]
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Failed to read PowerSaveMode: %s", exc)
+            return PS_ON
+
+    def set_power_save_mode(self, mode):
+        try:
+            self.bus.call_sync(
+                DISPLAY_CONFIG_NAME, DISPLAY_CONFIG_PATH,
+                "org.freedesktop.DBus.Properties", "Set",
+                GLib.Variant("(ssv)", (DISPLAY_CONFIG_IFACE, "PowerSaveMode",
+                                       GLib.Variant("i", mode))),
+                None, Gio.DBusCallFlags.NONE, 1000, None,
+            )
+            log.info("Set PowerSaveMode to %s.", mode)
+        except Exception as exc:  # noqa: BLE001
+            log.error("Failed to set PowerSaveMode to %s: %s", mode, exc)
+
+    def start(self):
+        if not self.connect_bus():
+            GLib.timeout_add_seconds(BUS_RETRY_SEC, self.start)
+            return False
+
+        self.bus.signal_subscribe(
+            None,
+            "org.freedesktop.DBus.Properties",
+            "PropertiesChanged",
+            DISPLAY_CONFIG_PATH,
+            None,
+            Gio.DBusSignalFlags.NONE,
+            self.on_properties_changed,
+            None,
+        )
+
+        mode = self.get_power_save_mode()
+        log.info("Initial Mutter PowerSaveMode: %s", mode)
+        if mode != PS_ON:
+            log.info("Screen is already blanked; engaging guard.")
+            self.engage_guard()
+        return False
+
+    def on_properties_changed(self, _conn, _sender, _path, _iface, _signal, params, _data):
+        try:
+            _iface_name, changed, _invalidated = params.unpack()
+            if "PowerSaveMode" not in changed:
+                return
+            mode = changed["PowerSaveMode"]
+            log.info("Display PowerSaveMode changed to: %s", mode)
+
+            if mode != PS_ON and not self.is_guarded:
+                log.info("Screen blanked; engaging guard.")
+                self.engage_guard()
+            elif mode == PS_ON and self.is_guarded:
+                if self.self_wake:
+                    self.self_wake = False
+                    log.info("Screen woken by the power key; disengaging guard.")
+                    self.disengage_guard()
+                else:
+                    log.warning("Screen woken by something else (notification/app/device)!")
+                    if self.config["REENFORCE_BLANK"]:
+                        self.schedule_reenforce()
+                    else:
+                        self.disengage_guard()
+        except Exception as exc:  # noqa: BLE001
+            log.error("Error while handling PropertiesChanged: %s", exc)
+
+    def schedule_reenforce(self):
+        if self.reenforce_source:
+            return
+        self.reenforce_source = GLib.timeout_add(REENFORCE_DELAY_MS, self.do_reenforce)
+
+    def do_reenforce(self):
+        self.reenforce_source = 0
+        if self.is_guarded:
+            log.info("Re-enforcing blank state (only the power key may wake the screen).")
+            self.set_power_save_mode(3)
+        return False
+
+    # ---------------- grabbing ----------------
+    def engage_guard(self):
+        if self.is_guarded:
+            return
+
+        self.config = load_config()
+        power_buttons, mice, touchpads, keyboards = scan_devices(self.config)
+
+        targets = [(node, name, True) for node, name in power_buttons]
+        targets += [(node, name, False) for node, name in mice]
+        targets += [(node, name, False) for node, name in touchpads]
+        targets += [(node, name, False) for node, name in keyboards]
+
+        for node, name, is_power in targets:
+            try:
+                fd = os.open(node, os.O_RDONLY | os.O_NONBLOCK)
+            except PermissionError:
+                log.error("Permission denied on %s -- run the unit with "
+                          "SupplementaryGroups=input.", node)
+                continue
+            except OSError as exc:
+                log.warning("Cannot open %s (%s): %s", node, name, exc)
+                continue
+            try:
+                fcntl.ioctl(fd, EVIOCGRAB, 1)
+            except OSError as exc:
+                log.warning("Cannot grab %s (%s): %s", node, name, exc)
+                os.close(fd)
+                continue
+
+            watch_id = GLib.io_add_watch(fd, GLib.IOCondition.IN,
+                                         self.on_input_event, (fd, is_power, name))
+            self.grabbed[fd] = (node, name, watch_id, is_power)
+            log.info("Grabbed %s (%s) [power=%s]", node, name, is_power)
+
+        self.is_guarded = True
+        log.info("Guard engaged: %d device(s) grabbed; only the power key can wake the screen.",
+                 len(self.grabbed))
+        self.suppress_notifications()
+
+    def disengage_guard(self):
+        if not self.is_guarded and not self.grabbed:
+            return
+
+        log.info("Disengaging guard and releasing input devices.")
+        for fd, (node, _name, watch_id, _is_power) in list(self.grabbed.items()):
+            try:
+                GLib.source_remove(watch_id)
+            except Exception:  # noqa: BLE001
+                pass
+            try:
+                fcntl.ioctl(fd, EVIOCGRAB, 0)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+        self.grabbed.clear()
+        self.is_guarded = False
+        self.restore_notifications()
+        log.info("All devices released; normal input restored.")
+
+    # ---------------- input events ----------------
+    def on_input_event(self, fd, _condition, user_data):
+        _fd, is_power, _name = user_data
+
+        if not is_power:
+            # Swallow mouse / touchpad / keyboard events so Mutter never sees them.
+            try:
+                os.read(fd, 1024)
+            except OSError:
+                pass
+            return True
+
+        try:
+            data = os.read(fd, INPUT_EVENT_SIZE * 8)
+        except OSError as exc:
+            log.error("Error reading power button event: %s", exc)
+            return True
+
+        offset = 0
+        while offset + INPUT_EVENT_SIZE <= len(data):
+            _sec, _usec, ev_type, ev_code, ev_value = struct.unpack_from(
+                INPUT_EVENT_FMT, data, offset)
+            offset += INPUT_EVENT_SIZE
+            if ev_type == EV_KEY and ev_code in (KEY_POWER, KEY_WAKEUP) and ev_value == 1:
+                log.info("Power button pressed; waking the display.")
+                self.self_wake = True
+                GLib.idle_add(self.wake_up)
+                return False
+        return True
+
+    def wake_up(self):
+        self.disengage_guard()
+        self.set_power_save_mode(PS_ON)
+        return False
+
+    # ---------------- main ----------------
+    def run(self):
+        GLib.idle_add(self.start)
+
+        def handle_signal(_sig, _frame):
+            log.info("Exiting on signal.")
+            self.disengage_guard()
+            self.loop.quit()
+
+        signal.signal(signal.SIGINT, handle_signal)
+        signal.signal(signal.SIGTERM, handle_signal)
+
+        try:
+            self.loop.run()
+        finally:
+            self.disengage_guard()
+
+
+def ensure_session_env():
+    """Make sure the session bus is reachable when running as a system service.
+
+    systemd's %U specifier does *not* follow User= in a system unit, so the unit
+    cannot point DBUS_SESSION_BUS_ADDRESS at the right /run/user/<uid> socket.
+    We are already running as the target user here, so derive it ourselves.
+    """
+    uid = os.getuid()
+    runtime_dir = "/run/user/{}".format(uid)
+    if not os.environ.get("XDG_RUNTIME_DIR") or not os.path.isdir(os.environ["XDG_RUNTIME_DIR"]):
+        if os.path.isdir(runtime_dir):
+            os.environ["XDG_RUNTIME_DIR"] = runtime_dir
+    if not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        bus = os.path.join(os.environ.get("XDG_RUNTIME_DIR", runtime_dir), "bus")
+        if os.path.exists(bus):
+            os.environ["DBUS_SESSION_BUS_ADDRESS"] = "unix:path={}".format(bus)
+    if not os.environ.get("HOME"):
+        try:
+            import pwd
+            os.environ["HOME"] = pwd.getpwuid(uid).pw_dir
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(message)s",
+        datefmt="%Y-%m-%d %H:%M:%S",
+    )
+    if "--version" in sys.argv:
+        print("gnome-blank-guard {}".format(VERSION))
+        return 0
+    ensure_session_env()
+    ScreenSleepGuard().run()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

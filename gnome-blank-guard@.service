@@ -1,0 +1,23 @@
+[Unit]
+Description=GNOME Blank Guard — keep a blanked screen dark until the power key is pressed
+Documentation=https://github.com/jexjws/gnome-blank-guard
+# Start together with the graphical session. The daemon retries on its own until
+# the session bus of %i shows up, so starting before login is harmless.
+After=graphical.target systemd-user-sessions.service
+ConditionPathExists=/dev/input
+
+[Service]
+Type=simple
+User=%i
+# /dev/input/event* is root:input 0660. Granting the "input" group to this unit
+# only avoids making the user a permanent member of the input group.
+SupplementaryGroups=input
+ExecStart=/usr/local/bin/gnome-blank-guard
+Restart=always
+RestartSec=3
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=full
+
+[Install]
+WantedBy=graphical.target
